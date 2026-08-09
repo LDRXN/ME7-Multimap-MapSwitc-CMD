@@ -4,6 +4,13 @@ Open-source command-line tool for creating **MultiMap / MapSwitch firmware for B
 
 The application automatically analyzes the ECU binary, detects the required calibration maps, creates additional calibration banks, installs the MultiMap runtime and map selectors, and generates an **XDF definition** for editing all created banks in TunerPro.
 
+
+# 🔀 Bosch ME7.5 MultiMap / MapSwitch CMD
+
+### Automatic Map Detection • 2–4 Banks • Cruise / Brake Switching • MIL Confirmation • Automatic XDF Generation
+
+**Build MultiMap. Edit every bank. Switch maps directly from the vehicle controls.**
+
 ---
 
 ## ✨ Features
@@ -688,11 +695,3 @@ If you test the builder on another Bosch ME7.5 software version, please include 
 Open Source.
 
 See the repository license for details.
-
----
-
-# 🔀 Bosch ME7.5 MultiMap / MapSwitch CMD
-
-### Automatic Map Detection • 2–4 Banks • Cruise / Brake Switching • MIL Confirmation • Automatic XDF Generation
-
-**Build MultiMap. Edit every bank. Switch maps directly from the vehicle controls.**
