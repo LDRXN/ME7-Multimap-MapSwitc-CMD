@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 APP_NAME = "Bosch ME7.5 MultiMap Builder"
-APP_VERSION = "0.33-xdf-dr-meta"
+APP_VERSION = "0.34-validated-dr"
 EXPECTED_SIZE = 1024 * 1024
 REQUIRED_MAPS = ("LAMFA", "KFZW", "KFZW2", "LDRXN", "LDRXNZK", "KRKTE")
 MIN_BANKS=2
@@ -483,14 +483,21 @@ def ecu_bit(entries: dict[str,EcuEntry], name: str) -> Optional[int]:
     if mask<=0 or (mask & (mask-1)): return None
     return mask.bit_length()-1
 
-def resolve_switch_input(entries: dict[str,EcuEntry], role: str, required=True) -> Optional[SwitchInput]:
-    aliases=SWITCH_ALIASES[role]
-    for name in aliases:
-        addr=ecu_address(entries,name); bit=ecu_bit(entries,name)
-        if addr is not None and bit is not None:
-            return SwitchInput(role,name,addr,bit)
+def resolve_switch_input(entries, role, required=True):
+    for name in SWITCH_ALIASES[role]:
+        addr, bit = ecu_address(entries, name), ecu_bit(entries, name)
+        if addr is None or bit is None:
+            continue
+        # ME7Info can describe the upper byte by its odd byte address.
+        if addr & 1:
+            addr -= 1
+            bit += 8
+        if bit > 15:
+            continue
+        _bitoff(addr)
+        return SwitchInput(role, name, addr, bit)
     if required:
-        raise MapSwitchError(f"Required switch input not found in .ecu: {role} (aliases: {', '.join(aliases)})")
+        raise MapSwitchError(f"Required switch input not found in .ecu: {role}")
     return None
 
 def resolve_ecu_path(bin_path: Path, explicit: Optional[Path]) -> Path:
@@ -1255,61 +1262,38 @@ def _find_embedded_word_axis(binary: bytes, count: int, factor: float,
     return candidates
 
 
-def locate_ignition_axes_structural(binary: bytes, defs, maps):
-    """Resolve the shared KFZW/KFZW2 axes from the supplied XML model.
-
-    KFZW/KFZW2 reference SNM16ZUUB (16-point RPM) and SRL12ZUUB
-    (12-point load).  Prefer the exact Java/XML axis result when valid.  If
-    SRL12ZUUB fell into Java's 16->8-bit alt fallback on a false pattern,
-    recover the same XML-defined axis structure by its embedded WORD length,
-    choosing the closest valid 12-point axis to the validated 16-point RPM
-    axis.  No software-specific addresses are used.
-    """
-    y_def = _xml_def_by_id(defs, "SNM16ZUUB")
-    x_def = _xml_def_by_id(defs, "SRL12ZUUB")
-
-    y = maps.get("SNM16ZUUB")
-    if y is not None:
-        vals = _axis_values_word(binary, y.address, 16) if y.width == 2 and y.length == 16 else None
-        if vals is None or not _monotonic_axis(vals):
-            y = None
-
-    if y is None:
-        yc = _find_embedded_word_axis(binary, 16, y_def.conversion.factor)
-        # RPM axes are expected to be a meaningful increasing 16-point scale;
-        # choose only when the structural result is unambiguous enough.
-        yc = [c for c in yc if c[2][-1] * y_def.conversion.factor >= 1000]
-        if not yc:
-            return None, None
-        _, addr, vals = yc[0]
-        y = Located(id="SNM16ZUUB", address=addr, definition=y_def, length=16)
-        transfer_conversion(y, y_def.conversion); y.axis = True
-
-    # Accept exact SRL12ZUUB only if it retained the XML WORD representation
-    # and really has 12 points.  A width=1 result is the Java alt fallback and
-    # is not sufficient for a validated KFZW bank copy.
-    x = maps.get("SRL12ZUUB")
-    if x is not None:
-        vals = _axis_values_word(binary, x.address, 12) if x.width == 2 and x.length == 12 else None
-        if vals is None or not _monotonic_axis(vals):
-            x = None
-
-    if x is None:
-        xc = _find_embedded_word_axis(binary, 12, x_def.conversion.factor,
-                                      near=y.address, radius=0x400)
-        # Load axis should be a useful increasing scale.  Reject tiny helper
-        # axes; among valid candidates the Bosch KFZW load axis is the nearest
-        # 12-point WORD axis to SNM16ZUUB in the calibration axis cluster.
-        xc = [c for c in xc
-              if c[2][-1] * x_def.conversion.factor >= 80
-              and c[2][-1] * x_def.conversion.factor <= 300]
-        if not xc:
-            return None, None
-        _, addr, vals = xc[0]
-        x = Located(id="SRL12ZUUB", address=addr, definition=x_def, length=12)
-        transfer_conversion(x, x_def.conversion); x.axis = True
-
-    return x, y
+def locate_ignition_axes_structural(binary, defs, maps):
+    """Use both real axis producers, never the first nearby monotonic table."""
+    pair = locate_ignition_pair_structural(binary, defs)
+    if pair is None:
+        return None, None
+    groups = _verified_ignition_groups(binary, pair[2])
+    if len(groups) != 4:
+        return None, None
+    inputs = {(m.group(2),m.group(3),m.group(4)) for m in groups}
+    if len(inputs) != 1:
+        return None, None
+    header_word, y_result, x_result = next(iter(inputs))
+    axes = []
+    for name, result, count in [('SRL12ZUUB',x_result,12),('SNM16ZUUB',y_result,16)]:
+        pattern = re.compile(rb'\xE6\xFC(..)\xF2\xFD(..)\xF2\xFE' + re.escape(result) + rb'\xDA\x00(..)\xF6\xF4' + re.escape(result),re.S)
+        hits = [m for m in pattern.finditer(binary) if not m.start() & 1]
+        if len(hits) != 1:
+            return None,None
+        hit = hits[0]
+        if name=='SRL12ZUUB' and hit.group(1)!=header_word:
+            return None,None
+        raw = _linear_from_dpp_word(int.from_bytes(hit.group(1),'little'))
+        if not 0 <= raw < len(binary)-2 or java_get_int(binary,raw)!=count:
+            return None,None
+        d = _xml_def_by_id(defs,name)
+        ax = Located(id=name,address=raw,definition=d,pattern_location=hit.start()+2)
+        transfer_conversion(ax,d.conversion);set_axis(ax,binary)
+        values = _axis_values_word(binary,ax.address,count)
+        if ax.width!=2 or not _monotonic_axis(values):
+            return None,None
+        axes.append(ax)
+    return tuple(axes)
 
 
 def apply_strong_structural_pairs(binary: bytes, defs, maps, sources):
@@ -1468,9 +1452,11 @@ def allocate_and_copy(data: bytearray, maps, banks:int, dry_run=False):
     comps=selector_components(maps)
     one=payload_size(comps)
     total=one*(banks-1)
-    hole=find_ff_hole(data,total,PREFERRED_CAL_START)
+    if total > 0x4000:
+        raise MapSwitchError("Copied banks must fit one verified 16 KiB data page")
+    hole=find_ff_hole(data,total,PREFERRED_CAL_START,alignment=0x4000)
     if hole is None:
-        hole=find_ff_hole(data,total,FALLBACK_CAL_START)
+        hole=find_ff_hole(data,total,FALLBACK_CAL_START,alignment=0x4000)
     if hole is None:
         raise MapSwitchError(f"No contiguous FF area for {banks-1} selector-compatible copies ({total} bytes)")
     layouts=[]
@@ -1572,18 +1558,16 @@ DIRECT_MEM_OPCODES = {
 }
 
 
-def find_runtime_hook(data: bytes) -> Optional[int]:
-    """Locate the proven 1 MB ME7.5 cyclic hook exactly like Launch_V2.py."""
-    locations=[]
-    start=0
-    while True:
-        pos=data.find(RUNTIME_HOOK_SIGNATURE,start)
-        if pos < 0:
-            break
-        if pos >= 4:
-            locations.append(pos-4)
-        start=pos+1
-    return locations[-1] if locations else None
+def find_runtime_hook(data: bytes):
+    # Full overwritten instruction + following page-qualified ADDB sequence.
+    rx = re.compile(
+        rb"\xF3\xF8..\xD7\x40\x06\x02\x03\xF8.."
+        rb"\x9D\x02\xE7\xF8\xFF\x00\xF7\xF8.."
+        rb"\xE6\xFC..\xE6\xFD..\xC0\x8E\xC2\xFF..\xDA...\xF7\xF8..\xC2\xF4\x9A\xF8", re.S)
+    hits = [m.start() for m in rx.finditer(data) if not m.start() & 1 and m.start() >= 0x20000]
+    if len(hits) != 1:
+        return None
+    return hits[0]
 
 
 def original_hook_bytes(data: bytes, hook: Optional[int]) -> Optional[bytes]:
@@ -1596,14 +1580,24 @@ def ranges_overlap(a0:int,a1:int,b0:int,b1:int)->bool:
     return a0 < b1 and b0 < a1
 
 
-def find_runtime_code_cave(data: bytes, size:int, reserved:list[tuple[int,int]]) -> Optional[int]:
-    pos=RUNTIME_CODE_START
+def find_runtime_code_cave(data: bytes, size: int, reserved):
+    if size <= 0:
+        raise MapSwitchError("Runtime code size must be positive")
+    pos = RUNTIME_CODE_START
     while pos + size <= len(data):
-        idx=data.find(b"\xFF"*size,pos)
-        if idx < 0: return None
-        if all(not ranges_overlap(idx,idx+size,a,b) for a,b in reserved):
+        idx = data.find(b"\xFF" * size, pos)
+        if idx < 0:
+            return None
+        aligned = align_up(idx, 0x10)
+        if aligned != idx:
+            pos = aligned
+            continue
+        if (idx & 0xFFFF) + size > 0x10000:
+            pos = align_up(idx + 1, 0x10000)
+            continue
+        if all(not ranges_overlap(idx, idx + size, start, end) for start, end in reserved):
             return idx
-        pos=idx+1
+        pos = idx + 0x10
     return None
 
 
@@ -1618,46 +1612,63 @@ def all_ecu_ram_addresses(entries: dict[str,EcuEntry]) -> list[int]:
     return sorted(set(out))
 
 
-def direct_c167_refs_to_ram_range(data: bytes, ram_start:int, size:int) -> list[int]:
-    """Return ROM offsets of conservative direct C167 references to RAM range.
+def direct_c167_refs_to_ram_range(data: bytes, ram_start: int, size: int):
+    """Conservative direct/pointer reference check, not an indirect-use proof.
 
-    For 0x384xxx XRAM the injected ME7 code uses the 16-bit 0x4xxx suffix.
-    We therefore inspect common four-byte direct-memory instruction families
-    and reject a candidate when bytes 2..3 point anywhere inside its range.
-    This cannot see indirect pointer accesses, so a clean result is strong
-    evidence, not a mathematical proof that RAM is unused.
+    Check unqualified suffix references and EXTP #E1-qualified 14-bit
+    operands. Cache the scan once for the input image instead of rescanning
+    the entire flash separately for each candidate. Byte loads/stores and
+    arithmetic memory operands are included.
     """
-    words={(ram_start+i)&0xFFFF for i in range(size)}
-    hits=[]
-    lo=0x20000
-    hi=min(len(data)-3,0xC0000)
-    for i in range(lo,hi):
-        if data[i] not in DIRECT_MEM_OPCODES:
+    global _ram_reference_cache
+    cached = globals().get('_ram_reference_cache')
+    if cached is None or cached[0] is not data:
+        index = {}
+        direct = {0x02,0x03,0x12,0x13,0x22,0x23,0x32,0x33,
+                  0x42,0x43,0x52,0x53,0x62,0x63,0x72,0x73,
+                  0x82,0x92,0xA2,0xB2,0xC2,0xD2,0xF2,0xF3,
+                  0x84,0x94,0xA4,0xB4,0xC5,0xD5,0xF6,0xF7}
+        last_e1 = -100
+        for pos in range(0, len(data)-3, 2):
+            op = data[pos]
+            word = int.from_bytes(data[pos+2:pos+4], 'little')
+            if op == 0xD7 and data[pos+1] & 0xC0 == 0x40 and word == 0xE1:
+                last_e1 = pos
+            if op in direct or op == 0xE6:
+                targets = set()
+                if 0x4000 <= word < 0x5000:
+                    targets.add(0x380000 + word)
+                if pos-last_e1 <= 20 and (word & 0x3FFF) < 0x1000:
+                    targets.add(0x384000 + (word & 0x3FFF))
+                # Immediate far-pointer pair, e.g. MOV R12,#off; MOV R13,#E1.
+                if op == 0xE6 and data[pos+4:pos+6] == bytes((0xE6, (data[pos+1]+1)&255)) and data[pos+6:pos+8] == b'\xE1\x00':
+                    targets.add(0x384000 + (word & 0x3FFF))
+                for target in targets:
+                    index.setdefault(target, []).append(pos)
+        _ram_reference_cache = (data, index)
+    return sorted({p for a, refs in _ram_reference_cache[1].items()
+                   if ram_start-1 <= a < ram_start+size for p in refs})
+
+
+def ram_gap_candidates(entries, size=RUNTIME_RAM_SIZE):
+    occupied = []
+    for start, end in _ecu_ram_spans(entries):
+        start = max(RAM_SCAN_START, start - RAM_GUARD)
+        end = min(RAM_SCAN_END, end + RAM_GUARD)
+        if start >= end:
             continue
-        w=data[i+2] | (data[i+3]<<8)
-        if w in words:
-            hits.append(i)
-    return hits
-
-
-def ram_gap_candidates(entries: dict[str,EcuEntry], size:int=RUNTIME_RAM_SIZE) -> list[tuple[int,int,int,int]]:
-    """Return aligned candidates inside 0x384000..0x384FFF with guard space.
-
-    Tuple: (candidate, distance_to_nearest_symbol, guard_before, guard_after)
-    """
-    addrs=[a for a in all_ecu_ram_addresses(entries) if RAM_SCAN_START <= a < RAM_SCAN_END]
-    bounds=[RAM_SCAN_START] + addrs + [RAM_SCAN_END]
-    out=[]
-    for a,b in zip(bounds,bounds[1:]):
-        start=(a + RAM_GUARD + 0xF) & ~0xF
-        limit=b - RAM_GUARD
-        while start + size <= limit:
-            before=start-a
-            after=b-(start+size)
-            nearest=min(before,after)
-            out.append((start,nearest,before,after))
-            start += 0x10
-    return out
+        if occupied and start <= occupied[-1][1]:
+            occupied[-1] = (occupied[-1][0], max(occupied[-1][1], end))
+        else:
+            occupied.append((start, end))
+    gaps = []
+    prev = RAM_SCAN_START + RAM_GUARD
+    for start, end in occupied + [(RAM_SCAN_END - RAM_GUARD, RAM_SCAN_END)]:
+        for addr in range(align_up(prev), start - size + 1, 0x10):
+            before, after = addr - prev + RAM_GUARD, start - addr - size + RAM_GUARD
+            gaps.append((addr, min(before, after), before, after))
+        prev = max(prev, end)
+    return gaps
 
 
 def find_strong_ram_candidate(data: bytes, entries: dict[str,EcuEntry], size:int=RUNTIME_RAM_SIZE) -> Optional[RamCandidate]:
@@ -1675,12 +1686,13 @@ def find_strong_ram_candidate(data: bytes, entries: dict[str,EcuEntry], size:int
     return ranked[0]
 
 
-def analyze_explicit_ram(data: bytes, entries: dict[str,EcuEntry], addr:int, size:int) -> RamCandidate:
-    refs=direct_c167_refs_to_ram_range(data,addr,size)
-    syms=all_ecu_ram_addresses(entries)
-    nearest=min((abs(a-addr) for a in syms),default=0xFFFF)
-    overlaps=sum(1 for a in syms if addr <= a < addr+size)
-    verdict="PASS" if not refs and not overlaps and RAM_SCAN_START <= addr and addr+size <= RAM_SCAN_END else "REVIEW"
+def analyze_explicit_ram(data, entries, addr, size):
+    refs = direct_c167_refs_to_ram_range(data, addr, size)
+    spans = _ecu_ram_spans(entries)
+    overlaps = any(ranges_overlap(addr, addr+size, start, end) for start,end in spans)
+    nearest = min((min(abs(start-addr),abs(end-addr)) for start,end in spans), default=0xFFFF)
+    valid = not addr & 1 and RAM_SCAN_START <= addr and addr+size <= RAM_SCAN_END
+    verdict = 'PASS' if valid and not refs and not overlaps else 'REVIEW'
     return RamCandidate(addr,len(refs),nearest,0,0,verdict)
 
 
@@ -1775,27 +1787,27 @@ def _le16(v:int)->bytes:
     return bytes((v & 0xFF, (v >> 8) & 0xFF))
 
 
-def _ram_word(addr:int)->int:
-    if not (0x384000 <= addr < 0x385000):
-        raise MapSwitchError(f"Bench runtime RAM 0x{addr:06X} must be inside 0x384000-0x384FFF")
-    return addr & 0xFFFF
+def _ram_word(addr: int) -> int:
+    if not (RAM_SCAN_START <= addr < RAM_SCAN_END) or addr & 1:
+        raise MapSwitchError(f"Unaligned/out-of-range runtime WORD: 0x{addr:06X}")
+    return addr & 0x3FFF
 
 
-def _bitoff(address:int)->int:
-    rel=address-0xFD00
-    if rel < 0 or rel % 2:
-        raise MapSwitchError(f"Invalid bit-addressable FDxx address: 0x{address:06X}")
-    q=rel//2
-    if not 0 <= q <= 0xFF:
-        raise MapSwitchError(f"Bit address outside C167 bit window: 0x{address:06X}")
-    return q
+def _bitoff(address: int) -> int:
+    if address & 1:
+        raise MapSwitchError(f"Unaligned bit-addressable WORD: 0x{address:06X}")
+    if 0xFD00 <= address <= 0xFDFE:
+        return (address - 0xFD00) // 2
+    if 0xFF00 <= address <= 0xFFDE:
+        return 0x80 + (address - 0xFF00) // 2
+    raise MapSwitchError(f"Unsupported bit-addressable WORD: 0x{address:06X}")
 
 
-def _calls_operand(code_cave:int)->bytes:
-    # Same Setzi/Launch encoding used by the proven Launch_V2 installer.
-    a=code_cave+0x800000
-    text=f"{a:06x}"
-    return bytes.fromhex(text[0:2]+text[4:6]+text[2:4])
+def _calls_operand(code_cave: int) -> bytes:
+    if code_cave & 1 or not 0 <= code_cave < EXPECTED_SIZE:
+        raise MapSwitchError(f"Invalid CALLS destination 0x{code_cave:X}")
+    addr = code_cave + 0x800000
+    return bytes((addr >> 16, addr & 255, (addr >> 8) & 255))
 
 
 class _C167Builder:
@@ -1810,8 +1822,11 @@ class _C167Builder:
         for p in parts:
             if isinstance(p,int): self.b.append(p & 0xFF)
             else: self.b.extend(p)
-    def mov_r4_mem(self,addr): self.emit(0xF2,R4,_le16(_ram_word(addr)))
-    def mov_mem_r4(self,addr): self.emit(0xF6,R4,_le16(_ram_word(addr)))
+    def mov_r4_mem(self,addr): _emit_mov_reg_mem(self,R4,addr)
+    def mov_mem_r4(self,addr):
+        operand=_ram_word(addr)
+        _emit_extp(self,addr >> 14)
+        self.emit(0xF6,R4,_le16(operand))
     def mov_r4_imm(self,val): self.emit(0xE6,R4,_le16(val))
     def cmp_r4_imm(self,val): self.emit(0x46,R4,_le16(val))
     def add_r4_1(self): self.emit(0x08,0x41)  # ADD R4,#1
@@ -1855,6 +1870,7 @@ def build_bench_brake5_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,brake
     MTICKS=ram_base+10
     MAGIC=ram_base+12
     a=_C167Builder()
+    a.emit(0xEC,0x88,0xEC,R4)  # Preserve full R4 and caller PSW.
 
     # One-time RAM initialization. XRAM contents are not assumed after reset.
     a.mov_r4_mem(MAGIC); a.cmp_r4_imm(0x4D53); a.jmpr(CC_Z,'initialized')
@@ -1862,7 +1878,6 @@ def build_bench_brake5_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,brake
     a.mov_r4_imm(0)
     for _addr in (PREV,COUNT,BLINKS,MSTATE,MTICKS): a.mov_mem_r4(_addr)
     a.mov_r4_imm(0x4D53); a.mov_mem_r4(MAGIC)
-    a.bclr(mil.address,mil.bit)
     a.label('initialized')
 
     # Sanitize current bank after reset/corruption: valid range is 1..banks.
@@ -1934,6 +1949,7 @@ def build_bench_brake5_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,brake
 
     a.label('exit')
     # Recreate the original overwritten MOVB and return from CALLS wrapper.
+    a.emit(0xFC,R4,0xFC,0x88)
     a.emit(orig_hook,0xDB,0x00)
     code=a.finish()
     while len(code)%16: code += b'\xFF'
@@ -1968,6 +1984,7 @@ def build_bench_cruise_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,
     MTICKS=ram_base+10
     MAGIC=ram_base+12
     a=_C167Builder()
+    a.emit(0xEC,0x88,0xEC,R4)  # Preserve full R4 and caller PSW.
 
     # One-time RAM initialization.
     a.mov_r4_mem(MAGIC); a.cmp_r4_imm(0x4D53); a.jmpr(CC_Z,'initialized')
@@ -1976,7 +1993,6 @@ def build_bench_cruise_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,
     for _addr in (PREV_SET,PREV_RES,BLINKS,MSTATE,MTICKS):
         a.mov_mem_r4(_addr)
     a.mov_r4_imm(0x4D53); a.mov_mem_r4(MAGIC)
-    a.bclr(mil.address,mil.bit)
     a.label('initialized')
 
     # Sanitize current bank.
@@ -2014,6 +2030,11 @@ def build_bench_cruise_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,
     # Trigger is only active while clutch is held.
     a.label('trigger')
     a.jbit(False,clutch.address,clutch.bit,'clutch_off')
+    a.jbit(False,cruise_set.address,cruise_set.bit,'buttons_separate')
+    a.jbit(False,cruise_res.address,cruise_res.bit,'buttons_separate')
+    a.mov_r4_imm(1); a.mov_mem_r4(PREV_SET); a.mov_mem_r4(PREV_RES)
+    a.jmpr(CC_UC,'cruise_early_exit')
+    a.label('buttons_separate')
 
     # SET rising edge -> next bank.
     a.jbit(False,cruise_set.address,cruise_set.bit,'set_clear')
@@ -2026,6 +2047,7 @@ def build_bench_cruise_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,
     a.mov_r4_imm(1); a.mov_mem_r4(MSTATE)
     a.mov_r4_imm(mil_half_ticks); a.mov_mem_r4(MTICKS)
     a.bset(mil.address,mil.bit)
+    a.label('cruise_early_exit')
     a.jmpr(CC_UC,'exit')
 
     a.label('set_clear')
@@ -2067,6 +2089,7 @@ def build_bench_cruise_runtime(*,banks:int,ram_base:int,clutch:SwitchInput,
 
     a.label('exit')
     # Recreate the original overwritten MOVB and return from CALLS wrapper.
+    a.emit(0xFC,R4,0xFC,0x88)
     a.emit(orig_hook,0xDB,0x00)
     code=a.finish()
     while len(code)%16:
@@ -2162,7 +2185,7 @@ def print_selector_analysis(binary: bytes, maps, sources):
     print()
     print("  " + "─"*66)
     if passed:
-        ok("All required map access points validated")
+        ok("All required map access anchors located; full call-site checks follow")
     else:
         warn("Map access validation incomplete")
 
@@ -2458,7 +2481,7 @@ def print_v017_selector_patch_plan(binary: bytes, maps, layouts, banks: int):
     sites=build_v017_patch_sites(binary,maps)
     print(f"Validated executable patch sites : {len(sites)}")
     print(f"Configured banks                 : {banks}")
-    print(f"Selector state                   : current_bank RAM (proven v0.12 runtime)")
+    print(f"Selector state                   : current_bank RAM (v0.34 runtime; software-validated)")
 
     print("\nExecutable sites and saved original bytes")
     for st in sites:
@@ -2663,16 +2686,18 @@ def _raw_calls_target(binary: bytes, pos:int) -> tuple[bytes,int]:
         raise MapSwitchError(f"Could not decode CALLS at 0x{pos:06X}")
     return raw,target
 
-def _emit_mov_reg_mem(a:_C167Builder, reg:int, addr:int):
-    a.emit(0xF2,reg,_le16(_ram_word(addr)))
+def _emit_mov_reg_mem(a: _C167Builder, reg: int, addr: int):
+    operand = _ram_word(addr)
+    _emit_extp(a, addr >> 14)
+    a.emit(0xF2, reg, _le16(operand))
 
 def _emit_mov_reg_imm(a:_C167Builder, reg:int, value:int):
     a.emit(0xE6,reg,_le16(value))
 
-def _emit_cmp_reg_small(a:_C167Builder, regnum:int, value:int):
-    if not (0 <= regnum <= 15 and 0 <= value <= 15):
-        raise MapSwitchError("Small CMP supports R0..R15 and immediate 0..15")
-    a.emit(0x48, ((regnum & 0xF)<<4) | (value & 0xF))
+def _emit_cmp_reg_small(a: _C167Builder, regnum: int, value: int):
+    if not (0 <= regnum <= 15 and 0 <= value <= 7):
+        raise MapSwitchError("CMP immediate encoding requires R0..R15 and #0..7")
+    a.emit(0x48, (regnum << 4) | value)
 
 def _emit_extp(a:_C167Builder, dpp:int):
     a.emit(0xD7,0x40,_le16(dpp))
@@ -2692,12 +2717,13 @@ def _emit_call_raw(a:_C167Builder, raw:bytes):
 def _bank_targets(maps,layouts,banks,key):
     return [_selector_target_for_bank(maps,layouts,b,key) for b in range(1,banks+1)]
 
-def _branch_on_bank(a:_C167Builder, regnum:int, banks:int, prefix:str):
-    """Emit comparisons for banks 1..N-1; bank N is fall-through."""
-    for b in range(1,banks):
-        _emit_cmp_reg_small(a,regnum,b)
-        a.jmpr(CC_Z,f"{prefix}_bank{b}")
-    a.jmpr(CC_UC,f"{prefix}_bank{banks}")
+def _branch_on_bank(a: _C167Builder, regnum: int, banks: int, prefix: str):
+    if not MIN_BANKS <= banks <= MAX_BANKS:
+        raise MapSwitchError("Banks must be 2..4")
+    for bank in range(1, banks + 1):
+        _emit_cmp_reg_small(a, regnum, bank)
+        a.jmpr(CC_Z, f"{prefix}_bank{bank}")
+    a.jmpr(CC_UC, f"{prefix}_bank1")
 
 def _finish_padded(a:_C167Builder, align:int=16)->bytes:
     code=a.finish()
@@ -2705,50 +2731,40 @@ def _finish_padded(a:_C167Builder, align:int=16)->bytes:
         code += b'\xFF'
     return code
 
-def build_kfzw_selector(*,name:str,banks:int,ram_base:int,targets:list[int],
-                        original_lookup_call:bytes,helper_call:bytes)->bytes:
-    """Ignition selector with correct far-map helper stack contract.
-
-    The signature-located Bosch helper at 0x0262xx starts with:
-        mov r10,[r0]
-        mov r11,[r0+2]
-    so it expects two 16-bit words already present at [R0]/[R0+2].
-
-    The known working MultiMap strategy pushes the live interpolation inputs
-    R15 and R14 before bank selection, calls the far-map helper for copied
-    banks, then restores R0 with ADD R0,#4.
-
-    Bank 1 must preserve the stock lookup calling convention, so the two
-    temporary words are discarded before executing the original stock CALLS.
-    """
+def build_kfzw_selector(*, name, banks, ram_base, targets,
+                        original_lookup_call, helper_call, stride_address=None):
+    if stride_address is None:
+        raise MapSwitchError('Ignition selector requires a validated stride header')
     a=_C167Builder()
-    BANK=ram_base
-
-    # Preserve the live interpolation inputs exactly as the reference selector.
-    # 88 F0 = mov [-r0],r15
-    # 88 E0 = mov [-r0],r14
-    a.emit(0x88,0xF0)
-    a.emit(0x88,0xE0)
-
-    _emit_mov_reg_mem(a,R4,BANK)
+    a.emit(0xEC,0x88,0xEC,R4)  # Preserve caller PSW and scratch register.
+    _emit_checked_bank(a,R4,ram_base)
     _branch_on_bank(a,4,banks,name)
-
     for bank in range(1,banks+1):
-        a.label(f"{name}_bank{bank}")
+        a.label(f'{name}_bank{bank}')
+        a.emit(0xFC,R4,0xFC,0x88)
         if bank==1:
-            # Stock lookup expects the original register-based contract and
-            # does not consume the two temporary stack words.
-            a.emit(0x08,0x04)  # add r0,#4
             _emit_call_raw(a,original_lookup_call)
             _emit_rets(a)
-        else:
-            _,dpp,op=_flash_operand(targets[bank-1])
-            _emit_mov_reg_imm(a,R12,op)
-            _emit_mov_reg_imm(a,R13,dpp)
-            _emit_call_raw(a,helper_call)
-            a.emit(0x08,0x04)  # helper consumed parameters logically; restore stack
-            _emit_rets(a)
-
+            continue
+        # The far helper uses R10/R11 where the near helper uses R14/R15.
+        # Save those extra clobbers and reserve a final PSW slot below them.
+        a.emit(0xEC,0x88,0xEC,0xFA,0xEC,0xFB)
+        a.emit(0x88,0xF0,0x88,0xE0)
+        _,page,operand=_flash_operand(targets[bank-1])
+        _,stride_page,stride_operand=_flash_operand(stride_address)
+        _emit_mov_reg_imm(a,R12,operand)
+        _emit_mov_reg_imm(a,R13,page)
+        _emit_mov_reg_imm(a,R14,stride_operand)
+        _emit_mov_reg_imm(a,0xFF,stride_page)
+        _emit_call_raw(a,helper_call)
+        a.emit(0xEC,0x88)  # Capture lookup flags before MOV/stack cleanup.
+        a.emit(0xF0,0xDE,0xF0,0xEA,0xF0,0xFB)
+        a.emit(0xFC,0xFA)  # R10 = captured PSW, saved original R10 still on SP.
+        a.emit(0xF2,0xFB,0x12,0xFE)  # R11 = SP (system stack, not R0).
+        a.emit(0xC4,0xAB,0x04,0x00)  # Replace reserved final PSW slot.
+        a.emit(0x08,0x04)  # Discard the two software-stack input words.
+        a.emit(0xFC,0xFB,0xFC,0xFA,0xFC,0x88)
+        _emit_rets(a)
     return _finish_padded(a)
 
 
@@ -2763,12 +2779,14 @@ def build_ldr_selector(*,name:str,banks:int,ram_base:int,targets:list[int],
     R12/R13, preserving the other live lookup inputs.
     """
     a=_C167Builder()
+    a.emit(0xEC,0x88,0xEC,R4)
     BANK=ram_base
-    _emit_mov_reg_mem(a,R4,BANK)
+    _emit_checked_bank(a,R4,BANK)
     _branch_on_bank(a,4,banks,name)
 
     for bank in range(1,banks+1):
         a.label(f"{name}_bank{bank}")
+        a.emit(0xFC,R4,0xFC,0x88)
         if bank != 1:
             _,dpp,op=_flash_operand(targets[bank-1])
             _emit_mov_reg_imm(a,R12,op)
@@ -2797,14 +2815,16 @@ def build_lamfa_selector(*,banks:int,ram_base:int,maps,layouts,
     loads.  v0.23 restores them for every bank, including Bank 1.
     """
     a=_C167Builder()
+    a.emit(0xEC,0x88,0xEC,R4)
     BANK=ram_base
 
     # current_bank selection. R4 is rebuilt in every branch before lookup.
-    _emit_mov_reg_mem(a,R4,BANK)
+    _emit_checked_bank(a,R4,BANK)
     _branch_on_bank(a,4,banks,"lamfa")
 
     for bank in range(1,banks+1):
         a.label(f"lamfa_bank{bank}")
+        a.emit(0xFC,R4,0xFC,0x88)
 
         map_addr=_selector_target_for_bank(maps,layouts,bank,"LAMFA")
         x_addr=_selector_target_for_bank(maps,layouts,bank,"LAMFA.X")
@@ -2848,18 +2868,16 @@ def build_lamfa_selector(*,banks:int,ram_base:int,maps,layouts,
     return _finish_padded(a)
 
 
-def build_krkte_selector(*,name:str,regbyte:int,regnum:int,banks:int,ram_base:int,
-                         targets:list[int])->bytes:
+def build_krkte_selector(*,name,regbyte,regnum,banks,ram_base,targets):
     a=_C167Builder()
-    BANK=ram_base
-    # Same register carries profile number first and scalar result on return,
-    # matching the known working reference selectors R5/R4/R2.
-    _emit_mov_reg_mem(a,regbyte,BANK)
+    a.emit(0xEC,0x88)
+    _emit_checked_bank(a,regbyte,ram_base)
     _branch_on_bank(a,regnum,banks,name)
     for bank in range(1,banks+1):
-        a.label(f"{name}_bank{bank}")
-        _,dpp,op=_flash_operand(targets[bank-1])
-        _emit_mov_reg_extp(a,regbyte,dpp,op)
+        a.label(f'{name}_bank{bank}')
+        a.emit(0xFC,0x88)  # MOV must retain the incoming C/V flags.
+        _,page,operand=_flash_operand(targets[bank-1])
+        _emit_mov_reg_extp(a,regbyte,page,operand)
         _emit_rets(a)
     return _finish_padded(a)
 
@@ -2870,12 +2888,7 @@ def _find_far_lookup_helper(binary:bytes)->tuple[int,bytes]:
     software used during development contains the same routine at 0x0262AC.
     Therefore the executable function body is the invariant; its address is not.
     """
-    sig=bytes.fromhex(
-        "D4 A0 00 00 D4 B0 02 00 DC 4F A9 4E C0 4E F0 1A "
-        "C0 31 1B 1E F2 F1 0E FE 00 C1 F0 1B C0 31 00 C1 "
-        "DC 4D A9 4C D0 42 5C 8B 7C 1B 2D 0A DC 4D F4 6C "
-        "01 00 D0 63 20 32 5C 13 0B 3B F2 F3 0C FE 00 23"
-    )
+    sig=bytes.fromhex('d4 a0 00 00 d4 b0 02 00 dc 4f a9 4e c0 4e f0 1a c0 31 1b 1e f2 f1 0e fe 00 c1 f0 1b c0 31 00 c1 dc 4d a9 4c d0 42 5c 8b 7c 1b 2d 0a dc 4d f4 6c 01 00 d0 63 20 32 5c 13 0b 3b f2 f3 0c fe 00 23 f0 42 5c 8a 7c 1a 2d 15 00 ce dc 4d 99 4c d0 42 78 b0 2d 09 dc 4d a9 6c d0 63 20 32 5c 13 0b 3b f2 f3 0c fe 00 23 20 24 5c 12 0b 2a f2 f2 0c fe 00 42 db 00')
     hits=[]
     p=0
     while True:
@@ -2906,6 +2919,8 @@ def _find_selector_cave(data:bytes,size:int,reserved:list[tuple[int,int]])->Opti
         while pos+size <= len(data):
             idx=data.find(b'\xFF'*size,pos)
             if idx<0: break
+            if (idx & 0xFFFF)+size > 0x10000:
+                pos=align_up(idx+1,0x10000); continue
             if idx%0x10:
                 pos=idx+(0x10-(idx%0x10)); continue
             if all(not ranges_overlap(idx,idx+size,a,b) for a,b in reserved):
@@ -2919,59 +2934,20 @@ def build_bench_selectors(binary:bytes,maps,layouts,banks:int,rt:RuntimePrefligh
 
     helper_target,helper_call=_find_far_lookup_helper(binary)
 
-    # Identify hook sites from v0.18 strategy, not raw pointer loads.
-    krefs={}
-    for name in ("KFZW2","KFZW"):
-        m=maps[name]
-        refs=sorted(_find_operand_instructions(binary,m.pattern_location,m.address,192))
-        calls=[]
-        for p,b,_,_ in refs:
-            downstream=_find_calls_after(binary,p+4,24)
-            if not downstream:
-                raise MapSwitchError(f"{name} setup 0x{p:06X}: lookup CALLS not found")
-            cp,cb,target=downstream[0]
-            calls.append((cp,cb,target))
-        if len(calls)!=2:
-            raise MapSwitchError(f"{name}: expected 2 lookup CALLS, got {len(calls)}")
-        krefs[name]=calls
-
-    # All ignition sites must call the same stock lookup.
-    ignition_calls=krefs["KFZW"]+krefs["KFZW2"]
-    ignition_targets={x[2] for x in ignition_calls}
-    ignition_raw={x[1] for x in ignition_calls}
-    if len(ignition_targets)!=1 or len(ignition_raw)!=1:
-        raise MapSwitchError("KFZW/KFZW2 lookup CALLS are not uniform")
-    ignition_call=next(iter(ignition_raw))
-
-
-    # LDR calls in structural order: LDRXNZK first, LDRXN second for this pair.
-    l_anchor=maps["LDRXNZK"].pattern_location
-    l_calls=_find_calls_after(binary,l_anchor,72)
-    if len(l_calls)<2:
-        raise MapSwitchError("Expected two LDR lookup CALLS")
-    l_calls=l_calls[:2]
-
-    lm_calls=_find_calls_after(binary,maps["LAMFA"].pattern_location,96)
-    if len(lm_calls)!=1:
-        raise MapSwitchError(f"LAMFA: expected exactly 1 lookup CALLS, got {len(lm_calls)}")
-    lamfa_call=lm_calls[0]
-
-    # KRKTE inventory.
-    kr=maps["KRKTE"]
-    kr_reads=[x for x in _all_direct_operand_sites(binary,kr.address) if x[1][0]==0xF2]
-    if len(kr_reads)!=3:
-        raise MapSwitchError(f"KRKTE: expected 3 direct F2 reads, got {len(kr_reads)}")
+    krefs,ignition_call,l_calls,lamfa_call,kr_reads = _validated_selector_references(binary,maps)
     reg_map={0xF2:(R2,2),0xF4:(R4,4),0xF5:(R5,5)}
 
     wrappers={}
     wrappers["KFZW"]=build_kfzw_selector(
         name="kfzw",banks=banks,ram_base=rt.ram_base,
         targets=_bank_targets(maps,layouts,banks,"KFZW"),
-        original_lookup_call=ignition_call,helper_call=helper_call)
+        original_lookup_call=ignition_call,helper_call=helper_call,
+        stride_address=maps["KFZW"].x_axis.address-2)
     wrappers["KFZW2"]=build_kfzw_selector(
         name="kfzw2",banks=banks,ram_base=rt.ram_base,
         targets=_bank_targets(maps,layouts,banks,"KFZW2"),
-        original_lookup_call=ignition_call,helper_call=helper_call)
+        original_lookup_call=ignition_call,helper_call=helper_call,
+        stride_address=maps["KFZW"].x_axis.address-2)
 
     # First pair setup in the validated stream is LDRXNZK, second LDRXN.
     wrappers["LDRXNZK"]=build_ldr_selector(
@@ -3001,7 +2977,7 @@ def build_bench_selectors(binary:bytes,maps,layouts,banks:int,rt:RuntimePrefligh
 
         # If an EXTP immediately precedes the read, hook the 8-byte pair exactly
         # like the proven reference patch, otherwise hook the 4-byte F2 itself.
-        if p>=4 and binary[p-4:p]==bytes.fromhex("D7 40 07 02"):
+        if p>=4 and binary[p-4:p]==b"\xD7\x40"+_le16(dpp):
             hp=p-4; orig=bytes(binary[hp:hp+8]); psz=8
         else:
             hp=p; orig=bytes(binary[p:p+4]); psz=4
@@ -3045,7 +3021,7 @@ def print_bench_selector_plan(build:BenchSelectorBuild,binary:bytes):
     print(" V0.24 — KFZW/KFZW2 STACK-CONTRACT BENCH WRITE PLAN")
     print("═"*72)
     print(f"Selector cave       : 0x{build.cave:06X}-0x{build.cave+build.size-1:06X}")
-    print(f"Bosch far-map helper: 0x{build.helper_far_lookup:06X} (located by 64-byte signature)")
+    print(f"Bosch far-map helper: 0x{build.helper_far_lookup:06X} (located by complete 116-byte signature)")
     print("Ignition strategy   : Bank 1 stock CALLS; Bank 2..N far-map helper")
     print("\nWrappers")
     for name,(addr,code) in build.wrappers.items():
@@ -3237,6 +3213,9 @@ def _xdf_find_bank_component(layouts, bank:int, key:str):
 def _xdf_bank_addresses(maps, layouts, bank:int, map_name:str):
     """Return XDF addresses for a map in the selected bank."""
     m=maps[map_name]
+    if bank>1 and map_name in ("KFZW","KFZW2"):
+        z=_xdf_find_bank_component(layouts,bank,map_name)
+        return {"x":m.x_axis.address,"y":m.y_axis.address,"z":z.dest}
 
     if bank == 1:
         if map_name in ("KFZW","KFZW2"):
@@ -3352,6 +3331,8 @@ def _xdf_configure_entry(el, maps, layouts, bank:int, map_name:str):
     m=maps[map_name]
     addr=_xdf_bank_addresses(maps,layouts,bank,map_name)
     meta=DR_XDF_META[map_name]
+    if m.width*8 != meta["z"]["bits"]:
+        raise MapSwitchError(f"Unsupported {map_name} data width for XDF")
 
     title=el.find("title")
     if title is not None:
@@ -3362,6 +3343,9 @@ def _xdf_configure_entry(el, maps, layouts, bank:int, map_name:str):
         desc=ET.SubElement(el,"description")
     desc.text=(meta["description"] if bank==1
                else f"Multi-map set {bank}: {meta['description']}")
+
+    if map_name in ("KFZW","KFZW2"):
+        desc.text += "\nX/Y axes are shared by all banks; edits affect every bank."
 
     if el.tag=="XDFCONSTANT":
         _xdf_constant_data(el,m,addr["z"],meta=meta["z"])
@@ -3646,6 +3630,7 @@ def main():
     ok(f"BIN loaded: {p.name}"); ok("BIN size: 1 MB")
     ecu_path=resolve_ecu_path(p,args.ecu)
     entries=parse_ecu_file(ecu_path)
+    _validate_ecu_identity(original,ecu_path)
     ok(f"ECU loaded: {ecu_path.name} ({len(entries)} entries)")
     info("Searching MultiMap calibration maps...")
     maps, sources, variants=locate_maps(original, args.xml_dir)
@@ -3764,6 +3749,111 @@ def main():
         print("[BENCH] Runtime changes bank counter + MIL only. Calibration lookups still use stock Bank 1.")
     return 0
 
+def _emit_checked_bank(a: _C167Builder, reg: int, ram_base: int):
+    """Uninitialized state selects Bank 1, without writing RAM in a selector."""
+    prefix = f"state_{len(a.b)}"
+    _emit_mov_reg_mem(a, reg, ram_base + 12)
+    a.emit(0x46, reg, _le16(0x4D53))
+    a.jmpr(CC_Z, prefix + "_valid")
+    _emit_mov_reg_imm(a, reg, 1)
+    a.jmpr(CC_UC, prefix + "_done")
+    a.label(prefix + "_valid")
+    _emit_mov_reg_mem(a, reg, ram_base)
+    a.label(prefix + "_done")
+
+def _ecu_ram_spans(entries):
+    spans = []
+    for entry in entries.values():
+        try:
+            addr = int(entry.columns[1], 16)
+            size = int(entry.columns[2], 0)
+        except (IndexError, ValueError):
+            continue
+        if 0x380000 <= addr < 0x390000 and size > 0:
+            spans.append((addr, addr + size))
+    return sorted(spans)
+
+def _validate_ecu_identity(binary: bytes, ecu_path: Path):
+    text = ecu_path.read_text(encoding='latin-1')
+    for key in ('HWNumber', 'SWNumber', 'PartNumber'):
+        m = re.search(r'^\s*' + key + r'\s*=\s*\{([^}]+)\}', text, re.M)
+        if not m or m.group(1).strip().encode('ascii') not in binary:
+            raise MapSwitchError(f'.ecu identity mismatch or missing {key}')
+
+def _verified_ignition_groups(binary: bytes, anchor: int):
+    pattern = re.compile(rb'\xE6\xFC(..)\xE6\xFD(..)\xF2\xFE(..)\xF2\xFF(..)\xDA(.)(..)', re.S)
+    lo, hi = max(0,anchor-192), min(len(binary),anchor+224)
+    return [m for m in pattern.finditer(binary,lo,hi) if not m.start() & 1]
+
+def _validated_selector_references(binary, maps):
+    krefs = {'KFZW':[], 'KFZW2':[]}
+    groups = _verified_ignition_groups(binary,maps['KFZW'].pattern_location)
+    near_signature = bytes.fromhex('a9 4d c0 4d f0 1e c0 31 1b 1d f2 f1 0e fe 00 c1 f0 1f c0 31 00 c1 a9 4c d0 42 5c 8f 7c 1f 2d 09 f4 6c 01 00 d0 63 20 32 5c 13 0b 3f f2 f3 0c fe 00 23 f0 42 5c 8e 7c 1e 2d 13 00 cd 99 4c d0 42 78 f0 2d 08 a9 6c d0 63 20 32 5c 13 0b 3f f2 f3 0c fe 00 23 20 24 5c 12 0b 2e f2 f2 0c fe 00 42 db 00')
+    for m in groups:
+        target = _linear_from_dpp_word(int.from_bytes(m.group(1),'little'))
+        name = next((n for n in krefs if maps[n].address==target),None)
+        if name is None:
+            raise MapSwitchError('Unexpected ignition lookup in paired code block')
+        if _linear_from_dpp_word(int.from_bytes(m.group(2),'little')) != maps[name].x_axis.address-2:
+            raise MapSwitchError('Ignition stride header disagrees with executable axis reference')
+        pos = m.start()+16
+        raw,dst = _raw_calls_target(binary,pos)
+        if binary[dst:dst+len(near_signature)]!=near_signature:
+            raise MapSwitchError('Unsupported Bosch near ignition lookup implementation')
+        krefs[name].append((pos,raw,dst))
+    if any(len(v)!=2 for v in krefs.values()):
+        raise MapSwitchError('Expected four complete ignition pointer/input/CALLS groups')
+    raw_calls={entry[1] for group in krefs.values() for entry in group}
+    if len(raw_calls)!=1:
+        raise MapSwitchError('Ignition lookup targets differ')
+    ignition_call=next(iter(raw_calls))
+
+    la=maps['LDRXNZK'].pattern_location
+    # Structural pair finder anchors exactly at the first complete setup.
+    l_calls=[]
+    for name,at in [('LDRXNZK',la),('LDRXN',la+20)]:
+        block=binary[at:at+16]
+        if len(block)!=16 or block[:2]!=b'\xE6\xFC' or block[4:6]!=b'\xE6\xFD' or block[8:10]!=b'\xF2\xFE':
+            raise MapSwitchError('Incomplete LDR setup')
+        pointer=int.from_bytes(block[2:4],'little')+int.from_bytes(block[6:8],'little')*0x4000-0x800000
+        if pointer!=maps[name].y_axis.address-2:
+            raise MapSwitchError('LDR pointer mismatch')
+        raw,dst=_raw_calls_target(binary,at+12)
+        l_calls.append((at+12,raw,dst))
+    if l_calls[0][1]!=l_calls[1][1]:
+        raise MapSwitchError('LDR lookup targets differ')
+
+    lam=maps['LAMFA'];at=lam.pattern_location-2
+    # Each opcode and stack operation in the complete LAMFA setup is checked.
+    md,mo=_flash_operand(lam.address)[1:]
+    xd,xo=_flash_operand(lam.x_axis.address)[1:]
+    hd,ho=_flash_operand(lam.y_axis.address-2)[1:]
+    yd,yo=_flash_operand(lam.y_axis.address)[1:]
+    expected=(b'\xE6\xF4'+_le16(mo)+b'\xE6\xF5'+_le16(md)+b'\x88\x50\x88\x40'+
+              b'\xE6\xF4'+_le16(xo)+b'\xE6\xF5'+_le16(xd)+b'\x88\x50\x88\x40'+
+              b'\xD7\x40'+_le16(hd)+b'\xC2\xFC'+_le16(ho)+
+              b'\xE6\xFD'+_le16(yo)+b'\xE6\xFE'+_le16(yd)+
+              b'\xD7\x40'+_le16(hd)+b'\xC2\xFF'+_le16(ho+1))
+    if binary[at:at+len(expected)]!=expected:
+        raise MapSwitchError('Unsupported LAMFA pointer/header/stack setup')
+    pos=at+len(expected);raw,dst=_raw_calls_target(binary,pos)
+    lamfa_call=(pos,raw,dst)
+
+    kr=maps['KRKTE']
+    if kr.width!=2:
+        raise MapSwitchError('8-bit KRKTE selector requires a separate verified implementation')
+    _,page,operand=_flash_operand(kr.address)
+    pat=re.compile(re.escape(b'\xD7\x40'+_le16(page))+rb'\xF2([\xF2\xF4\xF5])'+re.escape(_le16(operand)))
+    kr_reads=[]
+    for match in pat.finditer(binary):
+        if match.start() & 1:
+            continue
+        p=match.start()+4
+        kr_reads.append((p,bytes(binary[p:p+4]),page,operand))
+    if len(kr_reads)!=3 or {x[1][1] for x in kr_reads}!={0xF2,0xF4,0xF5}:
+        raise MapSwitchError('Expected three page-qualified KRKTE reads in R2/R4/R5')
+    return krefs,ignition_call,l_calls,lamfa_call,kr_reads
+
 if __name__=="__main__":
     try: raise SystemExit(main())
     except MapSwitchError as e:
@@ -3775,7 +3865,7 @@ if __name__=="__main__":
 # ---------------------------------------------------------------------------
 # v0.13 SELECTOR ANALYSIS NOTES
 # ---------------------------------------------------------------------------
-# The v0.12 bank-counter + MIL runtime is proven on bench.
+# v0.34 has instruction-level software checks; hardware validation is still required.
 # Do NOT redirect calibration lookups merely from the map addresses.
 # Before selector patching, uniquely validate executable lookup/read sites for:
 #   LAMFA, KFZW, KFZW2, LDRXN, LDRXNZK, KRKTE
