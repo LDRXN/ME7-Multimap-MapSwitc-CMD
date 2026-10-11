@@ -4,10 +4,7 @@ Open-source command-line tool for creating **MultiMap / MapSwitch firmware for B
 
 The application automatically analyzes the ECU binary, detects the required calibration maps, creates additional calibration banks, installs the MultiMap runtime and map selectors, and generates an **XDF definition** for editing all created banks in TunerPro.
 
-
-# 🔀 Bosch ME7.5 MultiMap / MapSwitch CMD
-
-### Automatic Map Detection • 2–4 Banks • Cruise / Brake Switching • MIL Confirmation • Automatic XDF Generation
+### Automatic Map Detection • 2–4 Banks • Cruise / Brake Switching • RPM Bank Indication • Automatic XDF Generation
 
 **Build MultiMap. Edit every bank. Switch maps directly from the vehicle controls.**
 
@@ -20,7 +17,7 @@ The application automatically analyzes the ECU binary, detects the required cali
 - 🗺️ Supports **2–4 calibration banks**
 - 🔀 Runtime map switching
 - 🎛️ Two selectable switching methods
-- 💡 MIL / Check Engine confirmation of selected bank
+- 📈 Tachometer / RPM indication of selected bank
 - 📋 Automatic bank layout generation
 - 🧩 Automatic selector installation
 - 💾 Automatic output BIN creation
@@ -148,18 +145,22 @@ Bank 1 → Bank 2 → Bank 3 → Bank 4 → Bank 1
 
 ---
 
-# 💡 MIL Bank Confirmation
+# 📈 RPM Bank Indication
 
-After a successful bank change, the **MIL / Check Engine light** confirms the currently selected calibration bank.
+After a successful bank change, the **tachometer temporarily indicates the currently selected calibration bank**.
 
 ```text
-Bank 1 → 1 blink
-Bank 2 → 2 blinks
-Bank 3 → 3 blinks
-Bank 4 → 4 blinks
+Bank 1 → 1000 RPM
+Bank 2 → 2000 RPM
+Bank 3 → 3000 RPM
+Bank 4 → 4000 RPM
 ```
 
-This makes it possible to identify the active calibration bank without any additional display or external hardware.
+The indication is shown for approximately **2 seconds**. After that, the tachometer automatically returns to displaying the **real engine RPM**.
+
+The MultiMap runtime does not change the actual engine speed for this indication. It only temporarily changes the RPM value sent to the instrument cluster.
+
+This makes it possible to identify the active calibration bank directly on the factory tachometer without using the MIL / Check Engine light or any additional display.
 
 ---
 
@@ -172,7 +173,7 @@ Clutch
 Brake
 Cruise SET
 Cruise RES
-MIL / Check Engine
+Tachometer / RPM display output
 ```
 
 The required signals are detected and validated using the corresponding `.ecu` definition file.
@@ -225,7 +226,8 @@ Example:
 ```text
 ME7-Multimap-MapSwitch-CMD/
 │
-├── MapSwitch_ME7.exe
+├── MapSwitch_ME7_V2.exe
+├── MapSwitch_ME7_V2.py
 ├── ME7Info.exe
 │
 ├── dump.bin
@@ -241,13 +243,13 @@ You do **NOT** pass the `.ecu` file on the command line.
 Correct:
 
 ```bash
-MapSwitch_ME7.exe dump.bin
+MapSwitch_ME7_V2.exe dump.bin
 ```
 
 Incorrect:
 
 ```bash
-MapSwitch_ME7.exe dump.bin dump.ecu
+MapSwitch_ME7_V2.exe dump.bin dump.ecu
 ```
 
 The program automatically searches for:
@@ -271,7 +273,8 @@ is loaded.
 Before running the builder, your working directory should contain:
 
 ```text
-MapSwitch_ME7.exe
+MapSwitch_ME7_V2.exe
+MapSwitch_ME7_V2.py
 ME7Info.exe
 dump.bin
 dump.ecu
@@ -282,11 +285,14 @@ Example directory:
 ```text
 ME7-Multimap-MapSwitch-CMD/
 │
-├── MapSwitch_ME7.exe
+├── MapSwitch_ME7_V2.exe
+├── MapSwitch_ME7_V2.py
 ├── ME7Info.exe
 ├── dump.bin
 └── dump.ecu
 ```
+
+`MapSwitch_ME7_V2.py` is the Python source version of the builder. `MapSwitch_ME7_V2.exe` is the compiled Windows executable.
 
 `ME7Info.exe` is required to generate the `.ecu` definition if you do not already have one.
 
@@ -330,7 +336,7 @@ dump.ecu
 Run:
 
 ```bash
-MapSwitch_ME7.exe dump.bin
+MapSwitch_ME7_V2.exe dump.bin
 ```
 
 That's it.
@@ -598,9 +604,9 @@ The complete process is:
                │
                ▼
 ┌──────────────────────────────┐
-│       MapSwitch_ME7.exe      │
+│       MapSwitch_ME7_V2.exe      │
 │                              │
-│ MapSwitch_ME7.exe dump.bin   │
+│ MapSwitch_ME7_V2.exe dump.bin   │
 └──────────────┬───────────────┘
                │
                ▼
