@@ -1,468 +1,369 @@
 # 🔧 Bosch ME7.5 MultiMap — Core ECU Fix History (Without Pops & Bangs)
 
-**🐞 Known Issues | 🔍 Root Causes | 🛠️ Implemented Fixes | ✅ Resolved Bugs | 🧪 Verification Status**
+![ECU](https://img.shields.io/badge/ECU-Bosch%20ME7.5-3B82F6?style=flat-square) ![Scope](https://img.shields.io/badge/Scope-Core%20MultiMap-64748B?style=flat-square) ![ECUs](https://img.shields.io/badge/ECUs-3-2563EB?style=flat-square) ![AL](https://img.shields.io/badge/AL-Build%20PASS-16A34A?style=flat-square) ![AQ](https://img.shields.io/badge/AQ-Build%20PASS-16A34A?style=flat-square) ![Testing](https://img.shields.io/badge/C167%20Validation-Pending-F59E0B?style=flat-square)
 
-Technical documentation of the problems I encountered while developing Core MultiMap support for Audi A4 1.8T BFB ECU software.
+**🐞 Original Bugs | 🔍 Root Causes | 🛠️ Implemented Fixes | ✅ Results | 🧪 Remaining Verification**
+
+This is the technical fix history for **Core MultiMap**, covering three Bosch ME7.5 ECU software variants associated with the **Audi A4 1.8T BFB 163 HP (120 kW)** engine family.
+
+**ECUs covered:** `8E0909518AL` · `8E0909518AF` · `8E0909518AQ`
 
 > [!IMPORTANT]
-> 🔥 **Pops & Bangs is supported only for the 150 / 180 / 210 / 225 HP engine families.**
->
-> The ECUs documented here belong to the **163 HP family**, which is outside that range.
->
-> Missing Pops & Bangs calibration maps in these ECUs is **not considered a bug**.
+> 🔥 **Pops & Bangs is not part of this report.** My project's Pops & Bangs support is limited to the **150 / 180 / 210 / 225 HP** engine-power families. These investigated **163 HP** variants are outside that range. Missing Pops-specific maps in these ECUs is **expected behavior, not a bug**, and does not require a fix.
+
+> [!NOTE]
+> ✍️ **Manual Map Address Override is the final, intended fallback.** When a required Core map cannot be located automatically, I enter its correct **Bank 1 payload address** manually. I do not plan to force additional automatic map signatures for every ECU version. The patcher must still validate map structure, axes, C167 lookup references, hooks and memory allocation.
 
 ---
 
-## 📊 ECU Compatibility Overview
+## 📊 ECU Compatibility & Fix Overview
 
-| ECU Part Number | Engine | Status |
+| ECU part number | Bosch HW | Bosch SW | SW version | Factory application | Status | Remaining work |
+|---|---|---|---|---|---|---|
+| **`8E0909518AL`** | `0261208228` | `1037369311` | `0003` | 163 HP | ✅ **Build PASS — 2/3/4 banks** | Independent C167 disassembly and physical ECU testing pending |
+| **`8E0909518AF`** | `0261207939` | `1037366883` | `0003` | 163 HP | 🟡 **Manual fallback implemented** | Validate actual map references and full BIN/XDF generation |
+| **`8E0909518AQ`** | `0261208524` | `1037372505` | `0010` | 163 HP | ✅ **Patch generation PASS** | Independently disassemble and verify generated C167 code; hardware testing remains pending |
+
+**Status definitions:**
+
+- ✅ **Build PASS:** Successful BIN/XDF generation for the bank counts stated, including the patcher's pre-flight checks. It does **not** prove correct runtime behavior or in-vehicle operation.
+- 🟡 **Manual fallback available / verification pending:** Map entry is possible, but an end-to-end successful build for that particular ECU has not yet been confirmed.
+- 🔬 **Code-level validation pending:** Original-versus-modified C167 disassembly, runtime auditing and real ECU testing are separate stages.
+
+### 🧩 Core MultiMap Scope
+
+The Core builder handles **six calibration maps**:
+
+| Fueling | Ignition | Load / Boost |
 |---|---|---|
-| `8E0909518AL` | 163 HP | 🟡 Manual fallback implemented |
-| `8E0909518AF` | 163 HP | 🟡 Manual fallback implemented |
-| `8E0909518AQ` | 163 HP | ✅ Patch generation PASS |
+| `LAMFA`, `KRKTE` | `KFZW`, `KFZW2` | `LDRXN`, `LDRXNZK` |
 
-### ✍️ Manual Map Address Override
+**Bank 1** retains its original calibration locations. Additional banks receive separate map copies, with validated C167 lookup selectors used to choose the active bank.
 
-If automatic map detection fails, I use manually supplied Bank 1 calibration addresses.
-
-**This is the intended permanent solution.**
-
-I will not force additional automatic map detection for every software version.
-
-However, the patcher must still validate map dimensions, axes, lookup instructions, memory locations and selector references.
+The builder also prepares its switching runtime, optional tachometer bank indication, and matching XDF definitions.
 
 ---
 
-# 🟡 1. 8E0909518AL — 163 HP
+# 🟢 1. 8E0909518AL — Audi A4 1.8T BFB · 163 HP
 
-**🟡 Status: MANUAL FALLBACK AVAILABLE — FULL BUILD VALIDATION PENDING**
+**✅ Current Status: BUILD PASS — 2 / 3 / 4 BANKS · C167 DISASSEMBLY PENDING**
 
 ### 🔍 ECU Identification
 
 | Parameter | Value |
 |---|---|
-| Part Number | `8E0909518AL` |
+| ECU Part Number | `8E0909518AL` |
 | Bosch HW | `0261208228` |
 | Bosch SW | `1037369311` |
 | Software Version | `0003` |
+| Factory Engine Application | Audi A4 1.8T BFB, 163 HP |
+| Flash Size | 1 MiB |
 
-### 🐞 Problem — Required Calibration Maps Not Found Automatically
+During the AL investigation, I encountered **three connected issues**.
 
-**🚨 Original symptoms**
+The final build succeeded after supplying map addresses that matched the **actual AL BIN**.
 
-The automatic map detector could not validate all required Core MultiMap calibration maps.
+I did not need to force additional automatic-map recognition.
 
-The patching process could not safely continue without the correct original addresses.
+## 🐞 Problem 1 — Core Maps Not Found by Automatic Detection
 
-### ❓ What Caused the Problem?
+### 🚨 Original Symptoms
 
-The existing map-search patterns did not cover every calibration and lookup structure in this ECU software.
+Automatic search did not validate the following maps:
 
-This did not necessarily mean that the maps were missing.
+```text
+KFZW       AUTO=NOT FOUND
+KFZW2      AUTO=NOT FOUND
+LDRXN      AUTO=NOT FOUND
+LDRXNZK    AUTO=NOT FOUND
+```
 
-It meant that the automatic detector could not reliably identify them.
+The patcher requested manual Bank 1 addresses before it could continue.
+
+### ❓ Why It Happened
+
+The generic map patterns did not resolve all calibrations and references for this software layout.
+
+A missed automatic signature does **not** mean the calibration is absent.
 
 ### 🛠️ How I Addressed It
 
-I introduced the **Manual Map Address Override** mechanism.
+I retained **Manual Map Address Override** as the permanent fallback.
 
-The patcher can now accept the original Bank 1 payload addresses entered by the user.
+The patcher now allows me to:
 
-The validation process checks the supplied addresses before continuing.
+- ✅ Enter the correct map addresses manually.
+- ✅ Validate map geometry and calibration data.
+- ✅ Resolve the required axes.
+- ✅ Validate C167 lookup sites before installing selectors.
+- ✅ Continue patch generation without forcing new automatic signatures.
 
-### ✅ What Has Been Resolved?
+I am **not** extending automatic detection merely to eliminate a manual entry step.
 
-- ✅ Manual map-address entry is supported.
-- ✅ Automatic detection is no longer mandatory when valid manual addresses are available.
-- ✅ The decision to keep manual entry as the fallback is final.
+### ✅ Result
 
-### 🔬 What Still Requires Verification?
-
-- 🔬 Correct locations of all six required Core maps.
-- 🔬 Map axes and code lookup references.
-- 🔬 Selector installation.
-- 🔬 Complete 2-, 3- and 4-bank BIN/XDF generation.
-
-### 🟡 Final Result
-
-The automatic-map-detection limitation has an accepted solution.
-
-**A complete successful patch-generation test has not yet been confirmed for this ECU.**
+**Automatic detection is no longer a blocker when correct addresses are available.**
 
 ---
 
-# 🟡 2. 8E0909518AF — 163 HP
+## 🐞 Problem 2 — Incorrect Map Addresses from a Multi-ECU WinOLS KP
 
-**🟡 Status: MANUAL FALLBACK AVAILABLE — COMPLETE VALIDATION PENDING**
+### 🚨 Original Manual Entries
 
-### 🔍 ECU Identification
+```text
+KFZW       0x012120
+KFZW2      0x0121E0
+LDRXN      0x01F076
+LDRXNZK    0x01F0B8
+```
 
-| Parameter | Value |
-|---|---|
-| Part Number | `8E0909518AF` |
-| Bosch HW | `0261207939` |
-| Bosch SW | `1037366883` |
-| Software Version | `0003` |
+These entries resulted in the following error:
 
-### 🐞 Problem — Automatic Calibration Detection Limitations
-
-The patcher did not reliably recognize some required Core MultiMap calibrations in this firmware.
-
-Previously, an automatic-detection failure could prevent the program from continuing even when the correct map addresses were known.
+```text
+KFZW: manual map address was supplied,
+but the shared 12x16 KFZW axes could not
+be resolved.
+```
 
 ### ❓ What Caused the Problem?
 
-Different ME7.5 firmware versions can use different calibration layouts and C167 lookup structures.
+The supplied WinOLS KP contained map definitions for multiple ECU software variants.
 
-A map-search signature that works in one ECU is not guaranteed to work in another.
+Although the addresses appeared in the KP, they were **not confirmed for the exact AL BIN**.
 
-### 🛠️ How I Addressed It
-
-I added manual Bank 1 map-address entry and validation.
-
-The supplied address is checked against the BIN and the expected calibration structure.
-
-The patcher must also resolve the corresponding axes and C167 lookup references before installing selectors.
-
-### ✅ What Has Been Resolved?
-
-- ✅ Manual map-address entry is available.
-- ✅ The automatic-map-detection limitation has an accepted workaround.
-- ✅ No further automatic-signature development is planned solely for this ECU.
-
-### 🔬 What Still Requires Verification?
-
-- 🔬 Complete validation of the required Core maps.
-- 🔬 Selector references and hook installation.
-- 🔬 Generation of valid 2-, 3- and 4-bank output.
-- 🔬 Static verification of the resulting firmware.
-
-**No separate Tach CAN failure has been confirmed for AF.**
-
-### 🟡 Final Result
-
-Manual map entry solves the original workflow limitation.
-
-Full ECU compatibility remains unconfirmed until the generated output has been checked.
-
----
-
-# 🟢 3. 8E0909518AQ — 163 HP
-
-**✅ Status: PATCH GENERATION PASS — CODE VERIFICATION PENDING**
-
-### 🔍 ECU Identification
-
-| Parameter | Value |
-|---|---|
-| Part Number | `8E0909518AQ` |
-| Bosch HW | `0261208524` |
-| Bosch SW | `1037372505` |
-| Software Version | `0010` |
-| ECU Flash | 1 MB |
-
-AQ required several corrections before the patcher could successfully complete the MultiMap build.
-
-## 🐞 Problem 1 — KFZW and KFZW2 Not Found
-
-### 🚨 Original Problem
-
-Automatic detection could not validate both ignition maps.
-
-Even after supplying their addresses manually, the patcher initially failed to resolve their shared axes.
-
-### ❓ What Caused the Problem?
-
-AQ uses a different C167 lookup structure and an alternative Bosch helper.
-
-The original axis-detection logic did not cover this layout.
+After inspecting the original firmware, I found that the C167 ignition references and calibration layout did not match the initially supplied addresses.
 
 ### 🛠️ How I Fixed It
 
-I extended axis recovery to use the actual ignition lookup instructions while keeping manual map-address entry.
+I compared the original `AL.bin` with its C167 map-lookup paths and identified the addresses matching the actual firmware.
 
-**📍 Verified Addresses**
+Instead of trusting the unverified KP entries, I used the locations validated against the supplied BIN.
 
-| Component | Address |
-|---|---|
-| KFZW | `0x012850` |
-| KFZW2 | `0x012910` |
-| Shared X Axis | `0x01398C` |
-| Shared Y Axis | `0x013906` |
+### 📍 Final Map Addresses Used in Successful Builds
 
-**✅ Result:** Both ignition maps and their shared axes pass patch-generation validation.
-
----
-
-## 🐞 Problem 2 — Five Ignition Lookup Calls
-
-### 🚨 Original Problem
-
-The earlier selector logic did not support all the ignition lookup locations in AQ.
-
-### ❓ What Caused the Problem?
-
-This ECU contains five relevant ignition calls using an alternative Bosch call instruction:
-
-```text
-DA 00 24 2B
-```
-
-### 🛠️ How I Fixed It
-
-I added support for all five lookup locations.
-
-| Lookup | Address |
-|---|---|
-| KFZW Call 1 | `0x0B8558` |
-| KFZW2 Call 1 | `0x0B8586` |
-| KFZW Call 2 | `0x0B85B0` |
-| KFZW2 Call 2 | `0x0B85CE` |
-| KFZW Call 3 | `0x0B85F8` |
-
-Original Bosch helper:
-
-```text
-0x0344D0
-```
-
-**✅ Result:** All five ignition call sites are included in successful patch generation.
-
----
-
-## 🐞 Problem 3 — LDRXN and LDRXNZK
-
-### 🚨 Original Problem
-
-The patcher could not automatically resolve the required LDR calibration maps and their lookup references.
-
-### 🛠️ How I Fixed It
-
-I identified the correct map payload locations and C167 lookup calls.
-
-| Component | Address |
-|---|---|
-| LDRXN | `0x029C8A` |
-| LDRXNZK | `0x029CCC` |
-| LDRXN Lookup | `0x08BEA2` |
-| LDRXNZK Lookup | `0x08BE88` |
-
-### ⚠️ Important — Manual Address Correction
-
-During testing, the following error appeared:
-
-```text
-LDRXN: manual address 0x029C68 is not
-preceded by a 16-point WORD axis header
-```
-
-The address entered was the beginning of the complete map block, not the actual calibration payload.
-
-| Map | Incorrect Address | Correct Address |
+| Required Core Map | Address in Tested AL BIN | Detection |
 |---|---|---|
-| LDRXN | `0x029C68` | `0x029C8A` |
-| LDRXNZK | `0x029CAA` | `0x029CCC` |
+| `LAMFA` | `0x026E66` | ✅ Automatic |
+| `KFZW` | `0x01284F` | ✅ Manual |
+| `KFZW2` | `0x01290F` | ✅ Manual |
+| `LDRXN` | `0x029C8A` | ✅ Manual |
+| `LDRXNZK` | `0x029CCC` | ✅ Manual |
+| `KRKTE` | `0x01FA14` | ✅ Automatic |
 
-The correct payload begins **0x22 bytes** after the block start.
+> [!NOTE]
+> The KFZW/KFZW2 values above are the **exact addresses accepted and copied by the tested builder** (`0x01284F` and `0x01290F`).
+>
+> Do not substitute adjacent addresses from another BIN or definition without checking the actual code and map representation.
 
-This was an incorrect manual address, not a new firmware patching bug.
+### ✅ Result
 
-**✅ Result:** Manual LDR validation succeeds with the corrected addresses.
+All six required Core maps were successfully validated.
+
+```text
+Core Maps: 6/6 VALIDATED
+```
+
+The patcher advanced to runtime and selector installation.
 
 ---
 
-## 🐞 Problem 4 — Tachometer CAN Hook Not Found
+## 🐞 Problem 3 — Manual KFZW/KFZW2 Axes Failed Validation
+
+After the initial map entries failed, I investigated the axis addresses listed in the KP.
+
+### 🚨 Original Axis Addresses
+
+| Axis | Address | Result |
+|---|---|---|
+| KFZW/KFZW2 X — 12 points | `0x01311C` | ❌ Invalid |
+| KFZW/KFZW2 Y — 16 points | `0x0130CA` | ❌ Invalid |
+
+The diagnostic confirmed that these addresses were not valid 12/16-point WORD axes in the supplied firmware.
+
+The preceding values were not valid axis headers, and the sampled values did not form the expected monotonic sequences.
 
 ### 🚨 Original Error
 
 ```text
-Tach CAN hook: NOT FOUND
-nmot_w loads: 58
-validated CAN candidates: 0
-structural RPM packers: 0
+KFZW/KFZW2 X: 0x01311C is neither a
+validated 12-point WORD axis header
+nor a payload immediately after one.
 ```
 
-### ❓ What Caused the Problem?
+### ❓ Why It Happened
 
-The original Tach CAN detector expected a direct transfer from `nmot_w` to register `R4`.
+The addresses were taken from an unverified multi-ECU definition.
 
-However, AQ uses an additional register.
+The patcher's axis validation correctly rejected them because their structure did not match the expected Bosch calibration format.
 
-### 🔍 Original C167 Instructions
+### 🛠️ How I Resolved It
 
-```text
-0x045076  F2 F9 9E F8   MOV  R9, nmot_w
-0x04507A  F0 49         MOV  R4, R9
-0x04507C  F7 F8 24 F8   MOVB F824, RL4
-...
-0x045086  7C 84         SHR  R4, #8
-0x045088  F7 F8 25 F8   MOVB F825, RL4
-```
+I inspected the actual AL firmware and followed the ignition lookup structure in C167.
 
-The actual RPM processing sequence is:
+This allowed the patcher to recover the correct shared axes.
 
-```text
-nmot_w
-   |
-   v
-Register R9
-   |
-   v
-Register R4
-   |
-   v
-F824 / F825
-   |
-   v
-CAN RPM data
-```
+### 📍 Correct KFZW/KFZW2 Axes
 
-### 🛠️ How I Fixed It
+| Axis | Payload Address | Geometry |
+|---|---|---|
+| X — Load | `0x01398C` | 12 WORD values |
+| Y — RPM | `0x013906` | 16 WORD values |
 
-I improved the Tach CAN detector to recognize this alternative register sequence.
+**No manual axis override was needed in the final successful builds.**
 
-The changes included:
+The correct solution was to provide valid map addresses and let the existing C167 validation recover the corresponding axes.
 
-- ✅ Detecting the `nmot_w → R9 → R4` structure.
-- ✅ Validating the complete RPM-packing sequence.
-- ✅ Avoiding fixed ECU-specific hook addresses.
-- ✅ Updating the wrapper to use the correct register path.
-- ✅ Preserving the previous direct-R4 detection mechanism.
+### ✅ Result
 
-### 📍 Tach CAN Locations
-
-| Component | Address |
-|---|---|
-| Tach CAN Hook | `0x045076` |
-| Tach Wrapper — tested 4-bank build | `0x0BFB60` |
-| RPM Buffer | `0xF824 / 0xF825` |
-
-### ✅ Final Result
-
-**The Tach CAN detection problem has been resolved at the patch-generation level.**
-
-The patcher now finds the hook and generates MultiMap output without disabling Tach CAN.
-
-Actual tachometer behavior must still be verified.
+- ✅ Correct ignition axes identified.
+- ✅ Invalid KP axis addresses rejected.
+- ✅ Map geometry validated.
+- ✅ Existing safety checks preserved.
+- ✅ Patch generation continued successfully.
 
 ---
 
-## 🧠 Runtime and Memory Validation
+## 🔗 AL Selector and Runtime Results
 
-| Component | Address |
+The tested four-bank build selected **11 Core call sites**, including five ignition lookups.
+
+### 📍 Verified Selector Locations
+
+| Function | C167 Call / Hook Address |
 |---|---|
-| Cyclic Hook | `0x0B8944` |
-| Runtime Code Cave | `0x0BF9A0` |
+| KFZW Call 1 | `0x0B83F8` |
+| KFZW2 Call 1 | `0x0B8426` |
+| KFZW Call 2 | `0x0B8450` |
+| KFZW2 Call 2 | `0x0B846E` |
+| KFZW Call 3 | `0x0B8498` |
+| LAMFA Call | `0x076422` |
+| LDRXNZK Call | `0x08BE88` |
+| LDRXN Call | `0x08BEA2` |
+| KRKTE R5 | `0x071CC8` |
+| KRKTE R4 | `0x0B959A` |
+| KRKTE R2 | `0x0B96F2` |
+
+### 🧠 Runtime and Memory Locations
+
+| Component | Address / Result |
+|---|---|
+| Cyclic Hook | `0x0B87E4` |
 | Runtime RAM | `0x384420` |
 | Tach CAN Hook | `0x045076` |
-| Core Selector Call Sites | 11 |
+| RPM CAN Instruction Path | `nmot_w → R9 → R4 → F824/F825` |
+| Selector Call Sites | 11 |
+| Copied Calibration Blocks — 4 Banks | 30 blocks |
 
-The patcher retains the original Bank 1 calibration and creates additional calibration copies for the selected banks.
+The four-bank build created 10 copied calibration blocks for each additional bank.
 
-I did not change unrelated XDF or calibration logic solely to implement the Tach CAN fix.
+The original Bank 1 calibration was preserved.
+
+> [!IMPORTANT]
+> Successful Tach CAN hook detection confirms that the patcher located and installed the hook during generation.
+>
+> It does not yet prove correct tachometer behavior in the physical vehicle.
 
 ---
 
-## 🧪 AQ Verification Results
+## 🧪 AL Verification Results
 
 | Test | Result |
 |---|---|
-| Original BIN and ECU definition | ✅ PASS |
-| Manual map-address validation | ✅ PASS |
-| Ignition axes | ✅ PASS |
-| Five ignition selectors | ✅ Build PASS |
-| LDR lookup references | ✅ PASS |
-| Cyclic hook / runtime allocation | ✅ PASS |
-| Tach CAN detection | ✅ PASS |
-| 2-bank generation | ✅ PASS |
-| 3-bank generation | ✅ PASS |
-| 4-bank generation | ✅ PASS |
-| Full C167 disassembly verification | 🔬 PENDING |
-| Real ECU / vehicle testing | 🔬 NOT TESTED |
+| Original AL BIN and ECU definition loaded | ✅ PASS |
+| Six Core calibrations validated | ✅ 6/6 |
+| Manual ignition and LDR map entry | ✅ PASS |
+| Shared 12×16 ignition axes identified | ✅ PASS |
+| Eleven selector call sites included | ✅ Build PASS |
+| Cyclic Hook / Runtime RAM pre-flight | ✅ PASS |
+| Tach CAN hook detection / installation | ✅ Build PASS |
+| 2-bank BIN/XDF generation | ✅ PASS |
+| 3-bank BIN/XDF generation | ✅ PASS |
+| 4-bank BIN/XDF generation | ✅ PASS |
+| Original vs modified C167 disassembly | 🔬 PENDING |
+| Real ECU / Vehicle Testing | 🔬 NOT YET CONFIRMED |
 
-**✅ AQ patch generation is now working correctly according to the completed build checks.**
+Example for AL 
 
----
+python3 MapSwitch_ME7_V2_V9_CORE_MANUAL_KFZW_AXES.py AL.bin \
+  --addr-kfzw 0x1284F \
+  --addr-kfzw2 0x1290F \
+  --addr-ldrxn 0x29C8A \
+  --addr-ldrxnzk 0x29CCC \
+  --banks 4 \
+  --switch-mode cruise
 
-# 🧩 Summary of Implemented Fixes
 
-| Component | Improvement | Status |
-|---|---|---|
-| 🗺️ Map Detection | Manual address entry as permanent fallback | ✅ Implemented |
-| 📈 Ignition Axes | Alternative C167 lookup handling | ✅ Fixed in AQ |
-| 🔗 KFZW/KFZW2 | Support for five ignition lookup calls | ✅ Fixed in AQ |
-| 📉 LDR Maps | Correct payload and lookup identification | ✅ Fixed in AQ |
-| 📡 Tach CAN | Support for the R9-to-R4 RPM path | ✅ Fixed in AQ build |
-| 🧠 Runtime Allocation | Validated runtime and memory locations | ✅ Build PASS in AQ |
-| 🧪 AL / AF | Full Core build verification | 🔬 Pending |
-| 🔍 C167 Runtime Validation | Independent disassembly comparison | 🔬 Pending |
 
----
 
-# 🔒 Development Policy
+### ✅ Final AL Result
 
-### ✅ What I Will Keep
+**The AL firmware now passes complete 2-, 3- and 4-bank patch generation.**
 
-- Manual map-address entry when automatic detection fails.
-- Existing map and selector validation.
-- Working memory-allocation and runtime mechanisms.
-- The corrected AQ ignition and LDR lookup handling.
-- The new Tach CAN detection mechanism.
-- Existing XDF behavior unless a reproducible issue is found.
+The earlier calibration-address and ignition-axis problems were resolved without forcing new automatic map-detection patterns.
 
-### 🚫 What I Will Not Change Unnecessarily
+The patcher now generates BIN/XDF output successfully using the addresses corresponding to the supplied original firmware.
 
-- I will not force automatic map detection for every ECU software version.
-- I will not add Pops & Bangs support to unsupported 163 HP applications.
-- I will not modify working components without evidence of a defect.
-- I will not consider successful patch generation proof of safe vehicle operation.
+**Full C167 disassembly and hardware validation remain pending.**
 
 ---
 
-# 📋 Remaining Work
+# 🟡 2. 8E0909518AF — Audi A4 1.8T BFB · 163 HP
 
-| ECU | Remaining Task |
+**🟡 Current Status: MANUAL FALLBACK AVAILABLE — COMPLETE VALIDATION PENDING**
+
+### 🔍 ECU Identification
+
+| Parameter | Value |
 |---|---|
-| `8E0909518AL` | Confirm complete Core MultiMap generation using correct manual map addresses |
-| `8E0909518AF` | Validate full BIN/XDF generation and selector references |
-| `8E0909518AQ` | Independently verify generated C167 code through disassembly |
+| ECU Part Number | `8E0909518AF` |
+| Bosch HW | `0261207939` |
+| Bosch SW | `1037366883` |
+| Software Version | `0003` |
+| Engine Application | Audi A4 1.8T BFB, 163 HP |
 
-> [!WARNING]
-> ⚠️ **BUILD PASS DOES NOT MEAN VEHICLE TESTED.**
->
-> Successful patch generation confirms that the patcher completed its documented build checks.
->
-> Runtime correctness, checksum validation, ECU compatibility and safe vehicle operation must be verified separately.
+## 🐞 Problem — Automatic Detection Was Not Sufficient for Every Core Map
 
----
+### 🚨 Original Symptoms
 
-# 🔬 Final Verification — Next Development Stage
+Some required calibration maps were not reliably recognized in the AF firmware.
 
-**The AQ patcher now works at the patch-generation stage.**
+Previously, an automatic-detection failure could prevent further patch preparation even when the correct map addresses were already known.
 
-It successfully accepts the correct manually supplied calibration addresses, installs the required selectors and Tach CAN hook, and generates BIN/XDF output for 2, 3 and 4 banks.
+### ❓ What Caused the Problem?
 
-**My next step will be to disassemble the original AQ firmware and the modified firmware.**
+The original recognition methods depended on expected calibration and C167 lookup patterns.
 
-I will compare the generated C167 instructions and verify:
+Different ME7.5 software versions can use different map layouts and code-reference structures.
 
-- 🔍 Original and overwritten instructions.
-- 🧩 All installed hooks and selectors.
-- 🧠 Register preservation and restoration.
-- 🔗 Branch and return behavior.
-- 💾 RAM and free-space allocation.
-- 📈 Calibration-bank references.
-- 📡 Tach CAN wrapper and RPM processing.
-- ✅ Correctness of the generated runtime logic.
+AF uses a different software arrangement, so successful map recognition in another ECU does not guarantee the same result here.
 
-Only after this independent disassembly and comparison will I consider the code-level implementation verified.
+This issue is **not related to missing Pops & Bangs maps**.
 
-**For AL and AF, manual map-address entry remains the intended solution. Full patch-generation validation is still pending.**
+AF belongs to the 163 HP family, which is outside the supported Pops & Bangs range in this project.
 
-Actual ECU and vehicle testing will be a separate final stage.
+## 🛠️ How I Addressed It
 
----
+I made manual Bank 1 map-address entry available whenever automatic detection cannot validate a required calibration.
 
-**Developed by LDRXN**
+The entry process checks the supplied address against the BIN and expected map structure.
 
-[GitHub — LDRXN](https://github.com/LDRXN)
+### 🔧 Implemented Improvements
+
+- ✅ Manual Bank 1 map-address entry.
+- ✅ Address-range validation.
+- ✅ Basic map-structure validation.
+- ✅ Support for continuing after failed automatic map recognition.
+- ✅ Validation of map axes and code references before selector installation.
+
+### ⚠️ Important
+
+A valid map payload address alone is not enough.
+
+The patcher must also correctly resolve:
+
+- Map dimensions.
+- X/Y axes where applicable.
+- C167 lookup instructions.
+- Selector installation locations.
+- Runtime and memory allocation.
+
