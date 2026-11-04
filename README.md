@@ -1,3 +1,14 @@
+<div align="center">
+
+## 📚 Select Documentation
+
+[📖 README.md](README.md) &nbsp;&nbsp; | &nbsp;&nbsp; [🐛 Bugs and Fixes.md](Bugs%20and%20Fixes.md)
+
+</div>
+
+---
+
+
 # 🔀 Bosch ME7.5 MultiMap / MapSwitch CMD
 
 Open-source command-line tool for creating **MultiMap / MapSwitch firmware for Bosch ME7.5 1MB ECUs**.
