@@ -19,6 +19,19 @@ The application automatically analyzes the ECU binary, detects the required cali
 
 **Build MultiMap. Edit every bank. Switch maps directly from the vehicle controls.**
 
+
+### 🔎 Automatic Detection & Manual Map Addresses
+
+The program includes an automatic map finder that attempts to locate all required **MultiMap calibration maps**.
+
+**A manual map address entry feature has also been added.**
+
+If the automatic finder cannot locate or validate a required map, the user can manually enter its address.
+
+This provides an alternative for ECU software versions where automatic detection is unsuccessful.
+
+**Important:** Manually entered map addresses must be verified before generating or flashing modified firmware. Incorrect addresses may result in invalid calibration data or improper ECU operation.
+
 ---
 
 ## ✨ Features
